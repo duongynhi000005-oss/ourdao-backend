@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Account, Keypair, MuxedAccount, StrKey } from '@stellar/stellar-sdk'
+import type { Pool } from 'pg'
 import {
   authenticateRequest,
   classifyStellarAddress,
   extractAuthHeaders,
+  generateTimestampedNonce,
   isValidStellarAddress,
+  parseNonceTimestamp,
   verifySignature,
   AuthFailureTracker,
   MemoryNonceStore,
+  NONCE_HEX_LENGTH,
+  NONCE_TIMESTAMP_HEX_WIDTH,
+  PostgresNonceStore,
   type AuthLogger,
   type NonceStore,
 } from '../src/auth.js'
@@ -661,3 +667,77 @@ describe('AuthFailureTracker — per-address exponential backoff (issues #183, #
     tracker.shutdown()
   })
 })
+
+describe('nonce timestamp width regression (issue #340)', () => {
+  it('generator and parser share NONCE_TIMESTAMP_HEX_WIDTH, assert 64-char length, and round-trip the timestamp', () => {
+    expect(NONCE_HEX_LENGTH).toBe(64)
+    expect(NONCE_TIMESTAMP_HEX_WIDTH).toBe(12)
+
+    const now = Date.now()
+    const nonce = generateTimestampedNonce(now)
+    expect(nonce).toHaveLength(NONCE_HEX_LENGTH)
+    expect(nonce).toMatch(/^[0-9a-f]{64}$/)
+    expect(parseNonceTimestamp(nonce)).toBe(now)
+    expect(Number.parseInt(nonce.slice(0, NONCE_TIMESTAMP_HEX_WIDTH), 16)).toBe(now)
+  })
+
+  it('fresh nonce from MemoryNonceStore authenticates end to end without fake timers', async () => {
+    const store = new MemoryNonceStore()
+    const before = Date.now()
+    const nonce = await store.issue(G)
+    const after = Date.now()
+
+    expect(nonce).toHaveLength(NONCE_HEX_LENGTH)
+    const parsedTs = parseNonceTimestamp(nonce)
+    expect(parsedTs).toBeGreaterThanOrEqual(before)
+    expect(parsedTs).toBeLessThanOrEqual(after)
+
+    const res = await authenticateRequest(
+      { authorization: `StellarSignature ${G}:${sign(nonce, G)}:${nonce}` },
+      store,
+    )
+    expect(res).toEqual({ authenticated: true, address: G })
+    await store.shutdown()
+  })
+
+  it('fresh nonce from PostgresNonceStore authenticates end to end without fake timers', async () => {
+    const rows = new Map<string, { nonce: string; address: string; expiresAt: Date }>()
+    const fakePool = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('INSERT INTO auth_nonces')) {
+          const [nonce, address, expiresAt] = params as [string, string, Date]
+          rows.set(nonce, { nonce, address, expiresAt })
+          return { rows: [{ nonce }], rowCount: 1 }
+        }
+        if (sql.includes('DELETE FROM auth_nonces') && params) {
+          const [nonce, address] = params as [string, string]
+          const row = rows.get(nonce)
+          if (row && row.address === address && row.expiresAt.getTime() > Date.now()) {
+            rows.delete(nonce)
+            return { rows: [{ nonce }], rowCount: 1 }
+          }
+          return { rows: [], rowCount: 0 }
+        }
+        return { rows: [], rowCount: 0 }
+      }),
+    } as unknown as Pool
+
+    const store = new PostgresNonceStore(fakePool)
+    const before = Date.now()
+    const nonce = await store.issue(G)
+    const after = Date.now()
+
+    expect(nonce).toHaveLength(NONCE_HEX_LENGTH)
+    const parsedTs = parseNonceTimestamp(nonce)
+    expect(parsedTs).toBeGreaterThanOrEqual(before)
+    expect(parsedTs).toBeLessThanOrEqual(after)
+
+    const res = await authenticateRequest(
+      { authorization: `StellarSignature ${G}:${sign(nonce, G)}:${nonce}` },
+      store,
+    )
+    expect(res).toEqual({ authenticated: true, address: G })
+    await store.shutdown()
+  })
+})
+
